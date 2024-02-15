@@ -77,8 +77,8 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
     vec_t<float, vec_size> k_vec;
     if constexpr (rotary_mode == RotaryMode::kLlama) {
       // apply rotary embedding for all rows in k matrix of kv-cache
-      k_vec = vec_apply_llama_rope<vec_size, bdx>(smem + j * bdx * vec_size, freq,
-                                                  kv_idx_base + tz * tile_size + j);
+      k_vec = vec_apply_llama_rope<vec_size, bdx, bdy, bdz>(smem + j * bdx * vec_size, freq,
+                                                            kv_idx_base + tz * tile_size + j);
     } else {
       // do not apply rotary embedding
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
@@ -234,8 +234,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = vec_apply_llama_rope<vec_size, bdx>(q + info.get_qo_elem_offset(0, qo_head_idx, 0),
-                                                freq, seq_len - 1);
+    q_vec = vec_apply_llama_rope<vec_size, bdx, bdy, bdz>(
+        q + info.get_qo_elem_offset(0, qo_head_idx, 0), freq, seq_len - 1);
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
@@ -377,7 +377,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = vec_apply_llama_rope<vec_size, bdx>(
+    q_vec = vec_apply_llama_rope<vec_size, bdx, bdy, bdz>(
         q + batch_idx * num_qo_heads * head_dim + info.get_qo_elem_offset(0, qo_head_idx, 0), freq,
         seq_len - 1);
   } else {
@@ -544,7 +544,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = vec_apply_llama_rope<vec_size, bdx>(
+    q_vec = vec_apply_llama_rope<vec_size, bdx, bdy, bdz>(
         q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim, freq,
         q_rope_position == nullptr ? (seq_len - 1) : q_rope_position[mapped_batch_idx]);
   } else {
