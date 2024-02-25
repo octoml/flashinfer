@@ -48,6 +48,23 @@
       uint32_t kv_len, float rope_scale, float rope_theta, cudaStream_t stream);               \
   }
 
+#define INST_SingleDecode(T, GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE) \
+  namespace flashinfer {                                                \
+  template cudaError_t SingleDecodeWithKVCacheDispatched <
+GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE, T,
+    T > (T * q, T* k, T* v, T* o, float* tmp, uint32_t num_qo_heads, uint32_t num_kv_heads,
+         uint32_t seq_len, float rope_scale, float rope_theta, cudaStream_t stream);
+}
+
+#define INST_BatchDecode(T, GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE) \
+  namespace flashinfer {                                               \
+  template cudaError_t BatchDecodeWithPagedKVCacheDispatched <
+GROUP_SIZE, HEAD_DIM, PageStorage::kIndices, LAYOUT, ROTARY_MODE, T, T,
+    int32_t > (T * q, int32_t* q_rope_position,
+               paged_kv_t<PageStorage::kIndices, LAYOUT, T, int32_t> paged_kv, T* o, T* tmp,
+               float* lse, float rope_scale, float rope_theta, cudaStream_t stream);
+}
+
 namespace flashinfer {
 
 class BatchPrefillHandler;

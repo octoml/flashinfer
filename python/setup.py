@@ -46,8 +46,10 @@ def get_instantiation_cu() -> List[str]:
     prefix = "csrc/generated"
     (root / prefix).mkdir(parents=True, exist_ok=True)
     dtypes = {"fp16": "nv_half"}
+    decode_dtypes = {"fp16": "nv_half"}
     if enable_bf16:
         dtypes["bf16"] = "nv_bfloat16"
+        decode_dtypes["bf16"] = "nv_bfloat16"
     group_sizes = os.environ.get("FLASHINFER_GROUP_SIZES", "1,4,8").split(",")
     head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
     group_sizes = [int(x) for x in group_sizes]
@@ -73,6 +75,47 @@ def get_instantiation_cu() -> List[str]:
             f.write("\n")
 
     files = []
+
+    # decode instantiations
+    for (group_size, head_dim, dtype, layout, rotary_mode,) in itertools.product(
+        group_sizes, head_dims, decode_dtypes, layout_options, rotary_mode_options
+    ):
+        # paged batch decode
+        fname = f"paged_batch_decode_group{group_size}_head{head_dim}_layout{layout}_rotary{rotary_mode}_{dtype}.cu"
+        files.append(prefix + "/" + fname)
+        if not (root / prefix / fname).exists():
+            with open(root / prefix / fname, "w") as f:
+                f.write('#include "../flashinfer_decl.h"\n\n')
+                f.write(f"#include <flashinfer.cuh>\n\n")
+                f.write(f"using namespace flashinfer;\n\n")
+                f.write(
+                    "INST_BatchDecodePagedWrapper({}, {}, {}, {}, {})\n".format(
+                        decode_dtypes[dtype],
+                        group_size,
+                        head_dim,
+                        "QKVLayout::k" + layout,
+                        "RotaryMode::k" + rotary_mode,
+                    )
+                )
+
+        # single decode
+        files.append(prefix + "/" + fname)
+        if not (root / prefix / fname).exists():
+            with open(root / prefix / fname, "w") as f:
+                f.write('#include "../flashinfer_decl.h"\n\n')
+                f.write(f"#include <flashinfer.cuh>\n\n")
+                f.write(f"using namespace flashinfer;\n\n")
+                f.write(
+                    "INST_SingleDecode({}, {}, {}, {}, {})\n".format(
+                        decode_dtypes[dtype],
+                        group_size,
+                        head_dim,
+                        "QKVLayout::k" + layout,
+                        "RotaryMode::k" + rotary_mode,
+                    )
+                )
+
+    # prefill instantiations
     for (
         group_size,
         head_dim,
