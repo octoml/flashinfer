@@ -64,12 +64,15 @@ namespace {
  * \param s A float indicates the thread-local result of qk
  * \param st The self-attention state to be updated
  */
-template <RotaryMode rotary_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T>
-__device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage_idx,
+template <RotaryMode rotary_mode, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
+          uint32_t tile_size_per_bdx, typename T>
+__device__ __forceinline__ void compute_qk(const T* smem, float2* smem_rope_workspace,
+                                           uint32_t compute_stage_idx,
                                            const vec_t<float, vec_size>& q_vec,
                                            const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
                                            uint32_t iter_base, uint32_t iter_bound, float sm_scale,
                                            float* s, state_t<vec_size>& st) {
+  constexpr uint32_t tile_size = bdy * tile_size_per_bdx;
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
   float m_prev = st.m;
 #pragma unroll
@@ -77,8 +80,13 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
     vec_t<float, vec_size> k_vec;
     if constexpr (rotary_mode == RotaryMode::kLlama) {
       // apply rotary embedding for all rows in k matrix of kv-cache
-      k_vec = vec_apply_llama_rope<vec_size, bdx, bdy, bdz>(smem + j * bdx * vec_size, freq,
-                                                            kv_idx_base + tz * tile_size + j);
+      if (bdy == 1) {
+        k_vec = vec_apply_llama_rope<vec_size, bdx>(smem + j * bdx * vec_size, freq,
+                                                    kv_idx_base + tz * tile_size + j);
+      } else {
+        k_vec = vec_apply_llama_rope_cooperative<vec_size, bdx, bdy, bdz>(
+            smem + j * bdx * vec_size, freq, smem_rope_workspace, kv_idx_base + tz * tile_size + j);
+      }
     } else {
       // do not apply rotary embedding
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
@@ -222,6 +230,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
                                           sizeof(DTypeIn));
   float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
                                        sizeof(DTypeIn));
+  float2* smem_rope_workspace = (float2*)smem_md;
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
@@ -234,8 +243,13 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = vec_apply_llama_rope<vec_size, bdx, bdy, bdz>(
-        q + info.get_qo_elem_offset(0, qo_head_idx, 0), freq, seq_len - 1);
+    if constexpr (bdy == 1) {
+      q_vec = vec_apply_llama_rope<vec_size, bdx>(q + info.get_qo_elem_offset(0, qo_head_idx, 0),
+                                                  freq, seq_len - 1);
+    } else {
+      q_vec = vec_apply_llama_rope_cooperative<vec_size, bdx, bdy, bdz>(
+          q + info.get_qo_elem_offset(0, qo_head_idx, 0), freq, smem_rope_workspace, seq_len - 1);
+    }
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
@@ -284,10 +298,10 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<rotary_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
-        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
-        freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size, sm_scale,
-        s, st_local);
+    compute_qk<rotary_mode, vec_size, bdx, bdy, bdz, tile_size_per_bdx>(
+        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, smem_rope_workspace,
+        stage_idx, q_vec, freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz,
+        kv_chunk_size, sm_scale, s, st_local);
     block.sync();
     // load k
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -365,6 +379,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
   DTypeIn* k_smem = (DTypeIn*)smem;
   DTypeIn* v_smem = (DTypeIn*)(smem + num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn));
   float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn));
+  float2* smem_rope_workspace = (float2*)smem_md;
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
@@ -377,9 +392,15 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = vec_apply_llama_rope<vec_size, bdx, bdy, bdz>(
-        q + batch_idx * num_qo_heads * head_dim + info.get_qo_elem_offset(0, qo_head_idx, 0), freq,
-        seq_len - 1);
+    if (bdy == 1) {
+      q_vec = vec_apply_llama_rope<vec_size, bdx>(
+          q + batch_idx * num_qo_heads * head_dim + info.get_qo_elem_offset(0, qo_head_idx, 0),
+          freq, seq_len - 1);
+    } else {
+      q_vec = vec_apply_llama_rope_cooperative<vec_size, bdx, bdy, bdz>(
+          q + batch_idx * num_qo_heads * head_dim + info.get_qo_elem_offset(0, qo_head_idx, 0),
+          freq, smem_rope_workspace, seq_len - 1);
+    }
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + batch_idx * num_qo_heads * head_dim +
@@ -419,9 +440,9 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<rotary_mode, vec_size, bdx, bdy>(k_smem + (stage_idx * bdz + tz) * bdy * head_dim,
-                                                stage_idx, q_vec, freq, consumer_kv_idx_base,
-                                                iter * bdy * bdz, seq_len, sm_scale, s, st_local);
+    compute_qk<rotary_mode, vec_size, bdx, bdy, bdz, 1>(
+        k_smem + (stage_idx * bdz + tz) * bdy * head_dim, smem_rope_workspace, stage_idx, q_vec,
+        freq, consumer_kv_idx_base, iter * bdy * bdz, seq_len, sm_scale, s, st_local);
     block.sync();
     // load k
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
@@ -532,6 +553,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
                                                  head_dim * sizeof(DTypeIn));
   float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
                                        sizeof(DTypeIn));
+  float2* smem_rope_workspace = (float2*)smem_md;
 
   const uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
@@ -544,9 +566,15 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = vec_apply_llama_rope<vec_size, bdx, bdy, bdz>(
-        q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim, freq,
-        q_rope_position == nullptr ? (seq_len - 1) : q_rope_position[mapped_batch_idx]);
+    if (bdy == 1) {
+      q_vec = vec_apply_llama_rope<vec_size, bdx>(
+          q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim, freq,
+          q_rope_position == nullptr ? (seq_len - 1) : q_rope_position[mapped_batch_idx]);
+    } else {
+      q_vec = vec_apply_llama_rope_cooperative<vec_size, bdx, bdy, bdz>(
+          q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim, freq, smem_rope_workspace,
+          q_rope_position == nullptr ? (seq_len - 1) : q_rope_position[mapped_batch_idx]);
+    }
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
@@ -617,9 +645,9 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<rotary_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
-        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
-        freq,
+    compute_qk<rotary_mode, vec_size, bdx, bdy, bdz, tile_size_per_bdx>(
+        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, smem_rope_workspace,
+        stage_idx, q_vec, freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[mapped_batch_idx]) +
             cur_chunk_start + iter * tile_size_per_bdx * bdy * bdz,
         iter * tile_size_per_bdx * bdy * bdz, kv_chunk_len, sm_scale, s, st);
@@ -751,7 +779,9 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                       GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 8U) : 1U;
                   const uint32_t smem_size = 2U * num_stages_smem * bdy * tile_size_per_bdx * bdz *
                                                  head_dim * sizeof(DTypeIn) +
-                                             2U * bdy * bdz * sizeof(float);
+                                             ((rotary_mode == RotaryMode::kNone || bdy == 1)
+                                                  ? 2U * bdy * bdz * sizeof(float)
+                                                  : 2U * HEAD_DIM * bdz * sizeof(float));
 
                   auto kernel =
                       SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/true, ROTARY_MODE,
@@ -834,7 +864,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                     GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 8U) : 1U;
                 const uint32_t smem_size = 2U * num_stages_smem * bdy * tile_size_per_bdx * bdz *
                                                head_dim * sizeof(DTypeIn) +
-                                           2U * bdy * bdz * sizeof(float);
+                                           ((rotary_mode == RotaryMode::kNone || bdy == 1)
+                                                ? 2U * bdy * bdz * sizeof(float)
+                                                : 2U * HEAD_DIM * bdz * sizeof(float));
                 if (seq_len <= 256 || tmp == nullptr) {
                   // no need to use partition-kv kernel
                   auto kernel =
@@ -1067,9 +1099,11 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
             constexpr uint32_t tile_size_per_bdx =
                 GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 4U) : 1U;
             const uint32_t smem_size =
-                2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim * sizeof(DTypeIn) +
+                2U * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim * sizeof(DTypeIn) +
                 std::max(tile_size_per_bdx * num_threads * sizeof(DTypeIn*),
-                         2 * bdy * bdz * sizeof(float));
+                         ((rotary_mode == RotaryMode::kNone || bdy == 1)
+                              ? 2U * bdy * bdz * sizeof(float)
+                              : 2U * HEAD_DIM * bdz * sizeof(float)));
 
             auto partition_kv_kernel = BatchDecodeWithPagedKVCacheKernel<
                 /*partition_kv=*/true, ROTARY_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
@@ -1139,7 +1173,10 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
   constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 4U) : 1U;
   const uint32_t smem_size =
       2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeIn) +
-      std::max(tile_size_per_bdx * num_threads * sizeof(DTypeIn*), 2 * bdy * bdz * sizeof(float));
+      std::max(
+          tile_size_per_bdx * num_threads * sizeof(DTypeIn*),
+          ((ROTARY_MODE == RotaryMode::kNone || bdy == 1) ? 2 * bdy * bdz * sizeof(float)
+                                                          : 2U * HEAD_DIM * bdz * sizeof(float)));
 
   if (tmp == nullptr) {
     // do not use partition-kv kernel
@@ -1261,7 +1298,9 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
   constexpr uint32_t bdz = num_threads / (bdx * bdy);
 
   const uint32_t smem_size =
-      2 * num_stages_smem * bdy * bdz * HEAD_DIM * sizeof(DTypeIn) + 2 * bdy * bdz * sizeof(float);
+      2 * num_stages_smem * bdy * bdz * HEAD_DIM * sizeof(DTypeIn) +
+      ((ROTARY_MODE == RotaryMode::kNone || bdy == 1) ? 2U * bdy * bdz * sizeof(float)
+                                                      : 2U * HEAD_DIM * bdz * sizeof(float));
 
   dim3 nblks(batch_size, num_kv_heads);
   dim3 nthrs(bdx, bdy, bdz);

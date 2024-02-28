@@ -61,9 +61,30 @@ inline std::string RotaryModeToString(const RotaryMode& rotary_mode) {
  * \param freq A vector of float indicates the thread-local rope frequency
  * \param offset A integer indicates the offset of the position in RoPE
  */
-template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename T>
+template <uint32_t vec_size, uint32_t bdx, typename T>
 __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope(
-    const T* x, const vec_t<float, vec_size>& freq, float2* smem_sincos, uint32_t offset) {
+    const T* x, const vec_t<float, vec_size>& freq, uint32_t offset) {
+  constexpr uint32_t head_dim = vec_size * bdx;
+  const uint32_t tx = threadIdx.x;
+  vec_t<float, vec_size> permuted_vec, vec;
+  vec.cast_load(x + tx * vec_size);
+  permuted_vec.cast_load(x + ((tx * vec_size < head_dim / 2) ? tx * vec_size + head_dim / 2
+                                                             : tx * vec_size - head_dim / 2));
+
+#pragma unroll
+  for (uint32_t i = 0; i < vec_size; ++i) {
+    float embed = float(offset) * freq[i];
+    float cos, sin;
+    __sincosf(embed, &sin, &cos);
+    vec[i] =
+        vec[i] * cos + ((tx * vec_size < head_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
+  }
+  return vec;
+}
+
+template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename T>
+__device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cooperative(
+    const T* x, const vec_t<float, vec_size>& freq, float2* smem_workspace, uint32_t offset) {
   constexpr uint32_t head_dim = vec_size * bdx;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> permuted_vec, vec;
@@ -71,34 +92,25 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope(
   permuted_vec.cast_load(x + ((tx * vec_size < head_dim / 2) ? tx * vec_size + head_dim / 2
                                                              : tx * vec_size - head_dim / 2));
 
-  if (bdy == 1) {
+  // when bdy > 1, the approach above will cause redundant computation (different threadIdx.y
+  // will compute the same value), so we use a different approach to avoid redundant computation:
+  // different threadIdx.y will compute different values, and use shared memory to shuffle.
 #pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      float embed = float(offset) * freq[i];
-      float cos, sin;
-      __sincosf(embed, &sin, &cos);
-      vec[i] = vec[i] * cos +
-               ((tx * vec_size < head_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
-    }
-  } else {
-    // when bdy > 1, the approach above will cause redundant computation (different threadIdx.y
-    // will compute the same value), so we use a different approach to avoid redundant computation:
-    // different threadIdx.y will compute different values, and use shared memory to shuffle.
-#pragma unroll
-    for (uint32_t i = 0; i < ceil_div(vec_size, bdy); ++i) {
+  for (uint32_t i = 0; i < ceil_div(vec_size, bdy); ++i) {
+    if (i * bdy + ty < vec_size) {
       float embed = float(offset) * freq[i * bdy + ty];
       float2 sincos;
       __sincosf(embed, &(sincos.x), &(sincos.y));
-      smem_sincos[(((i * bdz + tz) * bdy + ty) * bdx + tx)] = sincos;
+      smem_workspace[(((i * bdz + tz) * bdy + ty) * bdx + tx)] = sincos;
     }
-    __syncthreads();
+  }
+  __syncthreads();
 #pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      float2 sincos =
-          smem_sincos[((((i / vec_size) * bdz + tz) * bdy + (i % vec_size)) * bdx + tx)];
-      vec[i] = vec[i] * sincos.y +
-               ((tx * vec_size < head_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sincos.x;
-    }
+  for (uint32_t i = 0; i < vec_size; ++i) {
+    float2 sincos = smem_workspace[((((i / bdy) * bdz + tz) * bdy + (i % bdy)) * bdx + tx)];
+    float sin = sincos.x, cos = sincos.y;
+    vec[i] =
+        vec[i] * cos + ((tx * vec_size < head_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
   }
   return vec;
 }
