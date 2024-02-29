@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 by FlashInfer team.
+ * Copyright (c) 2024 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,13 +13,32 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_CUH_
-#define FLASHINFER_CUH_
+#ifndef FLASHINFER_QUANTIZATION_CUH_
+#define FLASHINFER_QUANTIZATION_CUH_
 
-#include "flashinfer/attention.cuh"
-#include "flashinfer/quantization.cuh"
-#include "flashinfer/layout.cuh"
-#include "flashinfer/page.cuh"
-#include "flashinfer/rope.cuh"
+#include "vec_dtypes.cuh"
 
-#endif  // FLASHINFER_CUH_
+namespace flashinfer {
+
+enum class QuantizationMode {
+  k8BitSym = 0U,
+  k8BitAsym = 1U,
+  k4BitSym = 2U,
+  k4BitAsym = 3U,
+};
+
+template <typename T>
+__device__ vec_t<T, > group_dequant
+
+template <QuantizationMode qmode, typename T>
+__global__ QuantizeKernel() {
+
+}
+
+template <QuantizationMode qmode>
+__global__ DequantizeKernel() {
+}
+
+}  // namespace flashinfer
+
+#endif  // FLASHINFER_QUANTIZATION_CUH_

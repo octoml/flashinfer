@@ -29,6 +29,14 @@
 
 namespace flashinfer {
 
+struct i4 {
+  uint8_t data : 4;
+};
+
+struct i8 {
+  uint8_t data;  
+};
+
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 
 template <typename float_t, size_t vec_size>
