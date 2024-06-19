@@ -181,7 +181,7 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
   } else {
     // num_index_sets == 0
     vec_t<DTypeOut, vec_size> v;
-    v.fill(0.f);
+    v.fill(0);
     v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
     if (s_merged != nullptr) {
       s_merged[pos * num_heads + head_idx] = -5e4;
@@ -365,7 +365,7 @@ __global__ void VariableLengthMergeStatesKernel(DTypeIn* __restrict__ V, float* 
   } else {
     // num_index_sets == 0
     vec_t<DTypeOut, vec_size> v;
-    v.fill(0.f);
+    v.fill(0);
     v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
     if (s_merged != nullptr) {
       s_merged[pos * num_heads + head_idx] = -5e4;
