@@ -207,7 +207,7 @@ template <bool produce_v, uint32_t num_warps_x, uint32_t num_warps_z, uint32_t n
 __device__ __forceinline__ void page_produce_kv(
     smem_t smem, uint32_t* smem_offset,
     paged_kv_t<page_storage, kv_layout, DType, IdType>& paged_kv, const uint32_t kv_idx_base,
-    const uint32_t packed_page_iter_base, const uint32_t kv_len, const IdType last_indptr) {
+    uint32_t* kv_offset, const uint32_t kv_len, const IdType last_indptr) {
   constexpr SharedMemFillMode fill_mode =
       produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
   constexpr uint32_t head_dim = num_frags_y * 16;
@@ -220,17 +220,19 @@ __device__ __forceinline__ void page_produce_kv(
   static_assert(num_frags_z * 4 % num_warps_x == 0);
 #pragma unroll
   for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x; ++i) {
-    uint32_t page_iter, entry_idx;
-    paged_kv.page_size.divmod(
-        packed_page_iter_base + warp_idx * 4 + lane_idx / 8 + 4 * num_warps * i, page_iter,
-        entry_idx);
-    DType* gptr = produce_v
-                      ? paged_kv.protective_get_v_ptr(page_iter, kv_head_idx, entry_idx,
-                                                      (lane_idx % 8) * num_elems_per_128b<DType>(),
-                                                      last_indptr)
-                      : paged_kv.protective_get_k_ptr(page_iter, kv_head_idx, entry_idx,
-                                                      (lane_idx % 8) * num_elems_per_128b<DType>(),
-                                                      last_indptr);
+    // uint32_t page_iter, entry_idx;
+    // paged_kv.page_size.divmod(
+    //     packed_page_iter_base + warp_idx * 4 + lane_idx / 8 + 4 * num_warps * i, page_iter,
+    //     entry_idx);
+    // DType* gptr = produce_v
+    //                   ? paged_kv.protective_get_v_ptr(page_iter, kv_head_idx, entry_idx,
+    //                                                   (lane_idx % 8) *
+    //                                                   num_elems_per_128b<DType>(), last_indptr)
+    //                   : paged_kv.protective_get_k_ptr(page_iter, kv_head_idx, entry_idx,
+    //                                                   (lane_idx % 8) *
+    //                                                   num_elems_per_128b<DType>(), last_indptr);
+    DType* gptr = produce_v ? paged_kv.data + paged_kv.kv_offset_delta() + kv_offset[i]
+                            : paged_kv.data + kv_offset[i];
 #pragma unroll
     for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
       smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
@@ -1582,6 +1584,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeIn)),
       v_smem(smem + (num_warps_x * num_frags_x + num_warps_z * num_frags_z) * 16 * head_dim *
                         sizeof(DTypeIn));
+  uint32_t kv_offset[num_frags_z * 4 / num_warps_x];
 
   uint32_t k_smem_offset_r = smem_t::get_permuted_offset<channel_size_128b_in>(
                get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + 8 * (lane_idx / 16) +
@@ -1595,13 +1598,23 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
   uint32_t packed_page_iter_base = paged_kv.indptr[request_idx] * paged_kv.page_size + chunk_start;
+  for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x; ++i) {
+    uint32_t page_iter, entry_idx;
+    paged_kv.page_size.divmod(
+        packed_page_iter_base + warp_idx * 4 + lane_idx / 8 + 4 * num_warps_x * num_warps_z * i,
+        page_iter, entry_idx);
+    kv_offset[i] =
+        page_iter < last_indptr
+            ? paged_kv.get_k_elem_offset(__ldg(paged_kv.indices + page_iter), kv_head_idx,
+                                         entry_idx, (lane_idx % 8) * num_elems_per_128b<DTypeIn>())
+            : 0;
+  }
+
   page_produce_kv<false, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
-      k_smem, &kv_smem_offset_w, paged_kv, chunk_start, packed_page_iter_base, chunk_end,
-      last_indptr);
+      k_smem, &kv_smem_offset_w, paged_kv, chunk_start, kv_offset, chunk_end, last_indptr);
   cp_async::commit_group();
   page_produce_kv<true, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
-      v_smem, &kv_smem_offset_w, paged_kv, chunk_start, packed_page_iter_base, chunk_end,
-      last_indptr);
+      v_smem, &kv_smem_offset_w, paged_kv, chunk_start, kv_offset, chunk_end, last_indptr);
   cp_async::commit_group();
 
   const uint32_t num_iterations =
@@ -1623,6 +1636,18 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
 #pragma unroll
   for (uint32_t iter = 0; iter < num_iterations; ++iter) {
+    packed_page_iter_base += 16 * num_warps_z * num_frags_z;
+    for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x; ++i) {
+      uint32_t page_iter, entry_idx;
+      paged_kv.page_size.divmod(
+          packed_page_iter_base + warp_idx * 4 + lane_idx / 8 + 4 * num_warps_x * num_warps_z * i,
+          page_iter, entry_idx);
+      kv_offset[i] = page_iter < last_indptr
+                         ? paged_kv.get_k_elem_offset(
+                               __ldg(paged_kv.indices + page_iter), kv_head_idx, entry_idx,
+                               (lane_idx % 8) * num_elems_per_128b<DTypeIn>())
+                         : 0;
+    }
     cp_async::wait_group<1>();
     block.sync();
 
@@ -1667,10 +1692,9 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     update_mdo_states<num_frags_x, num_frags_y, num_frags_z>(s_frag, o_frag, m, d);
 
     block.sync();
-    packed_page_iter_base += 16 * num_warps_z * num_frags_z;
     page_produce_kv<false, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
         k_smem, &kv_smem_offset_w, paged_kv,
-        chunk_start + (iter + 1) * 16 * num_warps_z * num_frags_z, packed_page_iter_base, chunk_end,
+        chunk_start + (iter + 1) * 16 * num_warps_z * num_frags_z, kv_offset, chunk_end,
         last_indptr);
     cp_async::commit_group();
     cp_async::wait_group<1>();
@@ -1683,7 +1707,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     block.sync();
     page_produce_kv<true, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
         v_smem, &kv_smem_offset_w, paged_kv,
-        chunk_start + (iter + 1) * 16 * num_warps_z * num_frags_z, packed_page_iter_base, chunk_end,
+        chunk_start + (iter + 1) * 16 * num_warps_z * num_frags_z, kv_offset, chunk_end,
         last_indptr);
     cp_async::commit_group();
   }
