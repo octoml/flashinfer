@@ -1634,7 +1634,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
            : chunk_end - chunk_start) /
       (16 * num_warps_z * num_frags_z);
 
-#pragma unroll
+#pragma unroll 4
   for (uint32_t iter = 0; iter < num_iterations; ++iter) {
     packed_page_iter_base += 16 * num_warps_z * num_frags_z;
     for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x; ++i) {
