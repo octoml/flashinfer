@@ -677,26 +677,39 @@ class BatchPrefillHandler {
     if (IsCUDAGraphEnabled()) {
       padded_batch_size_ = std::max(split_max_batch_size, total_num_tiles_q);
       AlignedAllocator allocator(buffer, workspace_size_in_bytes);
+      std::cout << "request_indices_ " << sizeof(IdType) * padded_batch_size_ << " "
+                << allocator.space << std::endl;
       request_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16);
       void* request_indices_h_ = page_locked_buffer_;
+      std::cout << "qo_tile_indices_ " << sizeof(IdType) * padded_batch_size_ << " "
+                << allocator.space << std::endl;
       qo_tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16);
       void* qo_tile_indices_h_ =
           (char*)page_locked_buffer_ + ((char*)qo_tile_indices_ - (char*)request_indices_);
+      std::cout << "kv_tile_indices_ " << sizeof(IdType) * padded_batch_size_ << " "
+                << allocator.space << std::endl;
       kv_tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16);
       void* kv_tile_indices_h_ =
           (char*)page_locked_buffer_ + ((char*)kv_tile_indices_ - (char*)request_indices_);
+      std::cout << "o_indptr_ " << sizeof(IdType) * (batch_size + 1) << " " << allocator.space
+                << std::endl;
       o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (batch_size + 1), 16);
       void* o_indptr_h_ = (char*)page_locked_buffer_ + ((char*)o_indptr_ - (char*)request_indices_);
+      std::cout << "kv_chunk_size_ptr_ " << sizeof(IdType) << " " << allocator.space << std::endl;
       kv_chunk_size_ptr_ = allocator.aligned_alloc<void>(sizeof(IdType), 1);
       void* kv_chunk_size_ptr_h_ =
           (char*)page_locked_buffer_ + ((char*)kv_chunk_size_ptr_ - (char*)request_indices_);
       *(IdType*)kv_chunk_size_ptr_h_ = kv_chunk_size;
       if (total_num_tiles_q < split_max_batch_size) {
         // need merge_indptr
+        std::cout << "merge_indptr_ " << sizeof(IdType) * (total_num_rows_ + 1) << " "
+                  << allocator.space << std::endl;
         merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (total_num_rows_ + 1), 16);
         void* merge_indptr_h_ =
             (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
         std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
+        std::cout << "block_valid_mask_h_ " << sizeof(bool) * padded_batch_size_ << " "
+                  << allocator.space << std::endl;
         block_valid_mask_ = allocator.aligned_alloc<bool>(sizeof(bool) * padded_batch_size_, 16);
         bool* block_valid_mask_h_ =
             (bool*)page_locked_buffer_ + ((bool*)block_valid_mask_ - (bool*)request_indices_);
@@ -722,8 +735,14 @@ class BatchPrefillHandler {
                                            cudaMemcpyHostToDevice, stream_))
 
       if (total_num_tiles_q < split_max_batch_size) {
+        std::cout << "tmp_v_ "
+                  << num_qo_heads * split_max_batch_size * qo_tile_size * head_dim *
+                         sizeof(DTypeOut)
+                  << " " << allocator.space << std::endl;
         tmp_v_ = allocator.aligned_alloc<void>(
             num_qo_heads * split_max_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut), 16);
+        std::cout << "tmp_s_ " << num_qo_heads * split_max_batch_size * qo_tile_size * sizeof(float)
+                  << " " << allocator.space << std::endl;
         tmp_s_ = allocator.aligned_alloc<float>(
             num_qo_heads * split_max_batch_size * qo_tile_size * sizeof(float), 16);
       } else {
@@ -733,26 +752,37 @@ class BatchPrefillHandler {
     } else {
       padded_batch_size_ = new_batch_size;
       AlignedAllocator allocator(buffer, workspace_size_in_bytes);
+      std::cout << "request_indices_ " << sizeof(IdType) * request_indices_vec.size() << " "
+                << allocator.space << std::endl;
       request_indices_ =
           allocator.aligned_alloc<void>(sizeof(IdType) * request_indices_vec.size(), 16);
       void* request_indices_h_ = page_locked_buffer_;
+      std::cout << "qo_tile_indices_ " << sizeof(IdType) * qo_tile_indices_vec.size() << " "
+                << allocator.space << std::endl;
       qo_tile_indices_ =
           allocator.aligned_alloc<void>(sizeof(IdType) * qo_tile_indices_vec.size(), 16);
       void* qo_tile_indices_h_ =
           (char*)page_locked_buffer_ + ((char*)qo_tile_indices_ - (char*)request_indices_);
+      std::cout << "kv_tile_indices_ " << sizeof(IdType) * kv_tile_indices_vec.size() << " "
+                << allocator.space << std::endl;
       kv_tile_indices_ =
           allocator.aligned_alloc<void>(sizeof(IdType) * kv_tile_indices_vec.size(), 16);
       void* kv_tile_indices_h_ =
           (char*)page_locked_buffer_ + ((char*)kv_tile_indices_ - (char*)request_indices_);
       if (split_kv) {
         // need merge_indptr when split_kv is true
+        std::cout << "merge_indptr_ " << sizeof(IdType) * merge_indptr_vec.size() << " "
+                  << allocator.space << std::endl;
         merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * merge_indptr_vec.size(), 16);
         void* merge_indptr_h_ =
             (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
         std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
       }
+      std::cout << "o_indptr_ " << sizeof(IdType) * o_indptr_vec.size() << " " << allocator.space
+                << std::endl;
       o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * o_indptr_vec.size(), 16);
       void* o_indptr_h_ = (char*)page_locked_buffer_ + ((char*)o_indptr_ - (char*)request_indices_);
+      std::cout << "kv_chunk_size_ptr_ " << sizeof(IdType) << " " << allocator.space << std::endl;
       kv_chunk_size_ptr_ = allocator.aligned_alloc<void>(sizeof(IdType), 1);
       void* kv_chunk_size_ptr_h_ =
           (char*)page_locked_buffer_ + ((char*)kv_chunk_size_ptr_ - (char*)request_indices_);
@@ -769,9 +799,19 @@ class BatchPrefillHandler {
       FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, page_locked_buffer_, num_bytes_to_copy,
                                            cudaMemcpyHostToDevice, stream_))
 
+      std::cout << batch_size << " " << new_batch_size << " " << qo_tile_size << " " << num_qo_heads
+                << " split_kv: " << split_kv << std::endl;
+      std::cout << "not use cudagraph, "
+                << num_qo_heads * new_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut) << " "
+                << workspace_size_in_bytes << std::endl;
       if (split_kv) {
+        std::cout << "tmp_s_ "
+                  << num_qo_heads * new_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut)
+                  << " " << allocator.space << std::endl;
         tmp_v_ = allocator.aligned_alloc<void>(
             num_qo_heads * new_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut), 16);
+        std::cout << "tmp_v_ " << num_qo_heads * new_batch_size * qo_tile_size * sizeof(float)
+                  << " " << allocator.space << std::endl;
         tmp_s_ = allocator.aligned_alloc<float>(
             num_qo_heads * new_batch_size * qo_tile_size * sizeof(float), 16);
       } else {
